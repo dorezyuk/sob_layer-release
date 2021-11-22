@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -48,7 +49,7 @@ constexpr char sob_layer__[] = "[sob_layer] ";
 
 inline bool
 is_free(const unsigned char& _c) noexcept {
-  return _c < costmap_2d::LETHAL_OBSTACLE;
+  return _c != costmap_2d::LETHAL_OBSTACLE;
 }
 
 template <typename T>
@@ -75,12 +76,14 @@ SobLayer::onInitialize() {
   // reinflate always after the init
   need_reinflation_ = true;
 
-  // match the parrent size
+  // match the parent size
   matchSize();
 
   ros::NodeHandle nh("~/" + name_);
 
   // load the config
+  inflate_unknown_ =
+      nh.param("inflate_unknown", layered_costmap_->isTrackingUnknown());
   inscribed_radius_ = nh.param("inscribed_radius", -1);
   use_auto_inscribed_radius_ = inscribed_radius_ <= 0;
 
@@ -117,6 +120,9 @@ SobLayer::matchSize() {
   v.resize(size_x);
   z.resize(size_x + 1);
 
+  // buffer for holding the squared values.
+  map_x_sq_.resize(size_x);
+
   SL_INFO("resized to " << map_x_.size());
 }
 
@@ -141,17 +147,14 @@ SobLayer::reconfigureCallback(config_type& _config, uint32_t _level) {
   // if the inflation radius has been changed, we need to redo everything
   need_reinflation_ |= inflation_radius_ != _config.inflation_radius;
   need_reinflation_ |= decay_ != -_config.cost_scaling_factor;
+  need_reinflation_ |= inflate_unknown_ != _config.inflate_unknown;
 
   inflation_radius_ = _config.inflation_radius;
   decay_ = -_config.cost_scaling_factor;
-
+  inflate_unknown_ = _config.inflate_unknown;
   enabled_ = _config.enabled;
   // let the user know
   SL_INFO("enabled: " << std::boolalpha << _config.enabled);
-
-  // warn the user for unsupported parameters
-  ROS_WARN_STREAM_COND(_config.inflate_unknown,
-                       sob_layer__ << "inflate_unknown unsupported");
 }
 
 void
@@ -230,7 +233,7 @@ SobLayer::verticalSwipe(const Costmap2D& _master, int dist, int min_i,
     auto gg = grid_m + _master.getIndex(min_i, jj_uu);
     const auto dd_end = map_x_.begin() + _master.getIndex(max_i, jj_uu);
 
-    // branchless formulation saying its either 0 or the previos incremented
+    // branchless formulation saying it's either 0 or the previos incremented
     // we know also that the domains never overlap, so lets convice the compiler
 #pragma GCC ivdep
     for (; dd != dd_end; ++dd, ++ss, ++gg)
@@ -269,16 +272,27 @@ void
 SobLayer::horizontalSwipe(Costmap2D& _master, int dist, int min_i, int min_j,
                           int max_i, int max_j) {
   const auto grid_m = _master.getCharMap();
-  const auto qq_max = max_i - min_i;
   const auto sq_dist = std::pow(dist, 2);
-  int k = 0;
+  int k, k_end, k_prev_end;
+  double s = 0;
+
+  const auto unknown_threshold =
+      inflate_unknown_ ? costmap_2d::FREE_SPACE
+                       : costmap_2d::INSCRIBED_INFLATED_OBSTACLE - 1;
+  auto update_cost = [&](const cost_type& _old,
+                         const cost_type& _new) -> const cost_type& {
+    if (_old != costmap_2d::NO_INFORMATION)
+      return std::max(_old, _new);
+    if (_new > unknown_threshold)
+      return _new;
+    return _old;
+  };
 
   // follows http://cs.brown.edu/people/pfelzens/papers/dt-final.pdf
   for (auto jj = min_j; jj != max_j; ++jj) {
-    // const-elements
-    // calculate the start and end indices for the current row (rr)
-    const auto max_rr = _master.getIndex(max_i, jj);
+    // begin of the interesting memory chunk.
     const auto min_rr = _master.getIndex(0, jj);
+    auto map_x_begin = map_x_.begin() + (min_rr + min_i);
 
     // init vars
     v[0] = min_i;
@@ -286,25 +300,29 @@ SobLayer::horizontalSwipe(Costmap2D& _master, int dist, int min_i, int min_j,
     z[1] = std::numeric_limits<double>::max();
     k = 0;
 
-    // init the first element of a row, since we start at 1
+    {
+      const auto end = map_x_.begin() + (min_rr + max_i);
+#pragma GCC ivdep
+      for (auto ss = map_x_begin, dd = map_x_sq_.begin() + min_i; ss != end;
+           ++ss, ++dd)
+        *dd = std::pow(*ss, 2);
+    }
+
     // if the first element is out of range, make sure that its 'parabola'
     // starts at inf, so the intersection is below 0
-    map_x_[min_rr + min_i] = std::pow(map_x_[min_rr + min_i], 2);
-    if (map_x_[min_rr + min_i] >= sq_dist)
-      map_x_[min_rr + min_i] = std::numeric_limits<int>::max();
+    if (map_x_sq_[min_i] >= sq_dist)
+      map_x_sq_[min_i] = std::numeric_limits<int>::max();
 
-    for (int ii = min_i + 1; ii != max_i; ++ii) {
+    ++map_x_begin;
+    for (int ii = min_i + 1; ii != max_i; ++ii, ++map_x_begin) {
       // ignore everything we don't care about
-      auto& ii_v = map_x_[min_rr + ii];
-      if (ii_v >= dist)
+      if (*map_x_begin >= dist)
         continue;
 
-      ii_v = std::pow(ii_v, 2);
-
-      auto s = parabolaIntersection(ii, ii_v, v[k], map_x_[min_rr + v[k]]);
+      s = parabolaIntersection(ii, map_x_sq_[ii], v[k], map_x_sq_[v[k]]);
       while (s <= z[k]) {
         --k;
-        s = parabolaIntersection(ii, ii_v, v[k], map_x_[min_rr + v[k]]);
+        s = parabolaIntersection(ii, map_x_sq_[ii], v[k], map_x_sq_[v[k]]);
       }
       ++k;
       v[k] = ii;
@@ -312,34 +330,37 @@ SobLayer::horizontalSwipe(Costmap2D& _master, int dist, int min_i, int min_j,
       z[k + 1] = std::numeric_limits<double>::max();
     }
 
-    if (k == 0 && map_x_[min_rr + min_i] >= sq_dist)
+    if (k == 0 && map_x_sq_[min_i] >= sq_dist)
       continue;
 
-    auto k_end = k + 1;
+    k_end = k + 1;
     k = 0;
 
     // skip all intervals ending in the negative
-    for (; k != k_end; ++k)
-      if (z[k + 1] >= min_i)
-        break;
+    while (z[k] < min_i)
+      ++k;
+    --k;
 
     // skip all intervals starting to high
-    for (; k_end > k; --k_end)
-      if (z[k_end - 1] < max_i)
-        break;
+    while (z[k_end] >= max_i)
+      --k_end;
+    ++k_end;
 
     // clamp the start and end to the range
     z[k] = std::max<double>(z[k], min_i);
     z[k_end] = std::min<double>(z[k_end], max_i);
 
-    // apply ceil to everything relevant [k, k_end]
-    const auto zz_end = z.begin() + k_end + 1;
-    for (auto zz = z.begin() + k; zz != zz_end; ++zz)
-      *zz = std::ceil(*zz);
+    {
+      // apply ceil to everything relevant [k, k_end]
+      const auto zz_end = z.begin() + k_end + 1;
+#pragma GCC ivdep
+      for (auto zz = z.begin() + k; zz != zz_end; ++zz)
+        *zz = std::ceil(*zz);
+    }
 
     for (; k != k_end; ++k) {
       // init the helpers
-      const auto row = static_cast<size_t>(std::sqrt(map_x_[min_rr + v[k]]));
+      const auto row = static_cast<size_t>(map_x_[min_rr + v[k]]);
       const auto& cache_row = cache_.at(row);
       const auto cache_size = (int)cache_row.size();
 
@@ -359,15 +380,16 @@ SobLayer::horizontalSwipe(Costmap2D& _master, int dist, int min_i, int min_j,
       // copy the data - again no overlap possible
 #pragma GCC ivdep
       for (; ss != ss_end; ++ss, ++dd)
-        *dd = std::max(*dd, *ss);
+        *dd = update_cost(*dd, *ss);
 
       // if we are on a horizontal line, copy the last cost
-      const auto sq_row = map_x_[min_rr + v[k]];
+      const auto& sq_row = map_x_sq_[v[k]];
+      k_prev_end = k_end - 1;
       --ss;
-      for (; k != k_end - 1; ++k, ++dd) {
-        if (z[k + 2] - z[k + 1] > 1 || map_x_[min_rr + v[k + 1]] != sq_row)
+      for (; k != k_prev_end; ++k, ++dd) {
+        if (z[k + 2] - z[k + 1] > 1 || map_x_sq_[v[k + 1]] != sq_row)
           break;
-        *dd = std::max(*dd, *ss);
+        *dd = update_cost(*dd, *ss);
       }
     }
   }
@@ -462,4 +484,4 @@ SobLayer::computeCache() noexcept {
 
 }  // namespace sob_layer
 
-PLUGINLIB_EXPORT_CLASS(sob_layer::SobLayer, costmap_2d::Layer);
+PLUGINLIB_EXPORT_CLASS(sob_layer::SobLayer, costmap_2d::Layer)
